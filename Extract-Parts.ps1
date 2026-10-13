@@ -15,14 +15,14 @@
 # Usage examples:
 #   .\Extract-Parts.ps1
 #   .\Extract-Parts.ps1 -SourceFolder "C:\Games\Roms" -OutputFolder "C:\Games\Output" -DeleteArchives -DeleteStandalone
-#   .\Extract-Parts.ps1 -NonInteractive -DryRun
-#   .\Extract-Parts.ps1 -NonInteractive -DeleteArchives
+#   .\Extract-Parts.ps1 -SourceFolder "C:\Games\Roms" -OutputFolder "C:\Games\Output" -NonInteractive -DryRun
+#   .\Extract-Parts.ps1 -SourceFolder "C:\Games\Roms" -OutputFolder "C:\Games\Output" -NonInteractive -DeleteArchives
 #
 # Behavior:
 #   - If command-line flags are provided, they take precedence.
 #   - Otherwise, the script asks interactively to confirm deletions.
 #   - Non-interactive runs default to safe behavior and skip destructive cleanup unless explicitly enabled.
-#   - Dry-run mode previews the work without deleting anything.
+#   - Dry-run mode scans inputs without installing dependencies or processing files.
 
 # --------------------------- Configuration ---------------------------
 param(
@@ -46,7 +46,6 @@ $NszPythonVenvFolder = Join-Path $NszInstallFolder "venv"
 
 # ------------------------------ Setup -------------------------------
 $ErrorActionPreference = 'Stop'
-$script:OutputFolder = $null
 $script:RarExe = $null
 $script:NszExe = $null
 $script:KeysFile = $null
@@ -69,6 +68,7 @@ if ($script:DryRun -or $script:NoDelete) {
     $script:DeleteStandaloneSources = $false
 }
 $script:StopProcessing = $false
+$script:LastCopyDestinationPath = $null
 $script:OverwriteAll = $false
 $script:SkipAll = $false
 $script:KeepBothAll = $false
@@ -104,6 +104,7 @@ try {
 $script:DiagnosticsLogPath = Join-Path $script:RunLogFolder ("ExtractParts_{0}.log" -f $script:RunId)
 $script:TranscriptPath = Join-Path $script:RunLogFolder ("ExtractParts_{0}_transcript.txt" -f $script:RunId)
 $script:TranscriptStarted = $false
+$script:LogWriteFailureReported = $false
 $script:WorkerLogCounter = 0
 try {
     Start-Transcript -Path $script:TranscriptPath -Force | Out-Null
@@ -118,7 +119,14 @@ function Write-Log {
         [ValidateSet('DEBUG','INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
     $line = '[{0}][{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
-    try { Add-Content -LiteralPath $script:DiagnosticsLogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch {}
+    try {
+        Add-Content -LiteralPath $script:DiagnosticsLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        if (-not $script:LogWriteFailureReported) {
+            $script:LogWriteFailureReported = $true
+            Write-Warning "Could not write diagnostic log '$script:DiagnosticsLogPath': $($_.Exception.Message)"
+        }
+    }
 }
 
 function Stop-RunLogging {
@@ -459,6 +467,11 @@ function Find-KeysFile {
 }
 
 function Select-KeysFile {
+    if ($script:NonInteractive -and -not $script:Force) {
+        Write-Host 'No keys file was detected; skipping the file picker in non-interactive mode.' -ForegroundColor Yellow
+        Write-Log -Message 'No keys file detected; file picker skipped in non-interactive mode.' -Level WARN
+        return $null
+    }
     Write-Host ''
     Write-Host 'NSZ requires a compatible keys file that you must obtain legally. The script will not download keys.' -ForegroundColor Yellow
     Write-Host 'Choose an existing prod.keys or keys.txt file in the file picker, or cancel to skip compression.' -ForegroundColor Yellow
@@ -489,7 +502,7 @@ function Select-Folder {
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
     $dialog.Description = $Description
     $dialog.SelectedPath = $InitialFolder
-    $dialog.ShowNewFolderButton = $true
+    $dialog.ShowNewFolderButton = -not $script:DryRun
     $result = $dialog.ShowDialog()
     $selected = $null
     if ($result -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dialog.SelectedPath)) {
@@ -502,7 +515,7 @@ function Select-Folder {
 function Get-ArchiveStarts {
     param([Parameter(Mandatory)][string]$Folder)
     @(
-        Get-ChildItem -LiteralPath $Folder -File -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $Folder -File -ErrorAction Stop |
             Where-Object {
                 ($_.Name -match '(?i)\.part0*1\.rar$') -or
                 (($_.Extension -ieq '.rar') -and ($_.Name -notmatch '(?i)\.part\d+\.rar$'))
@@ -517,7 +530,7 @@ function Get-LooseGameFiles {
     $files = @()
     foreach ($folder in $Folders) {
         if ([string]::IsNullOrWhiteSpace($folder) -or -not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
-        foreach ($file in (Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.nsp', '.xci') })) {
+        foreach ($file in (Get-ChildItem -LiteralPath $folder -File -ErrorAction Stop | Where-Object { $_.Extension -in @('.nsp', '.xci') })) {
             $key = $file.FullName.ToLowerInvariant()
             if (-not $seen.ContainsKey($key)) {
                 $seen[$key] = $true
@@ -532,7 +545,7 @@ function Get-EligibleFiles {
     param([Parameter(Mandatory)][string]$Folder)
     if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return @() }
     @(
-        Get-ChildItem -LiteralPath $Folder -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $Folder -File -Recurse -Force -ErrorAction Stop |
             Where-Object {
                 $_.Extension -ine '.url' -and
                 $_.FullName -notmatch '(?i)(^|[\\/])Internet\s*Shortcuts?([\\/]|$)'
@@ -543,7 +556,7 @@ function Get-EligibleFiles {
 function Get-ArchiveFilesToDelete {
     param([Parameter(Mandatory)][System.IO.FileInfo]$Archive)
 
-    $allFiles = @(Get-ChildItem -LiteralPath $SourceFolder -File -ErrorAction SilentlyContinue)
+    $allFiles = @(Get-ChildItem -LiteralPath $SourceFolder -File -ErrorAction Stop)
     $partOne = [regex]::Match($Archive.Name, '^(?<base>.+)\.part0*1\.rar$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($partOne.Success) {
         $base = $partOne.Groups['base'].Value
@@ -574,6 +587,7 @@ function Get-UniqueDestinationPath {
 
 function Copy-FlatFile {
     param([Parameter(Mandatory)][System.IO.FileInfo]$File)
+    $script:LastCopyDestinationPath = $null
     if ($script:StopProcessing) { return 'Quit' }
 
     $destination = Join-Path $script:OutputFolder $File.Name
@@ -591,6 +605,11 @@ function Copy-FlatFile {
         } elseif ($script:KeepBothAll) {
             $destination = Get-UniqueDestinationPath -Directory $script:OutputFolder -FileName $File.Name
             $action = 'KeepBoth'
+        } elseif ($script:NonInteractive -and -not $script:Force) {
+            $script:SkippedCount++
+            Write-Host "Skipping duplicate in non-interactive mode: $($File.Name)" -ForegroundColor DarkYellow
+            Write-Log -Message "Duplicate skipped in non-interactive mode: '$destination'." -Level WARN
+            return 'Skipped'
         } else {
             Write-Host "`nDuplicate filename detected:" -ForegroundColor Yellow
             Write-Host "  Existing: $destination"
@@ -616,6 +635,11 @@ function Copy-FlatFile {
         } else {
             Copy-Item -LiteralPath $File.FullName -Destination $destination -ErrorAction Stop
         }
+        $copiedFile = Get-Item -LiteralPath $destination -ErrorAction Stop
+        if ($copiedFile.Length -ne $File.Length) {
+            throw "Copied file size mismatch: expected $($File.Length) bytes, found $($copiedFile.Length) bytes."
+        }
+        $script:LastCopyDestinationPath = $destination
         $script:CopiedCount++
         Write-Log -Message "Copy $action succeeded: '$($File.FullName)' -> '$destination' ($($File.Length) bytes)." -Level INFO
         return $action
@@ -894,7 +918,7 @@ function Invoke-NSZConversion {
             throw "NSZ exited with code $($result.ExitCode). $detail"
         }
 
-        $outputs = @(Get-ChildItem -LiteralPath $workFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -ieq $expectedExtension })
+        $outputs = @(Get-ChildItem -LiteralPath $workFolder -File -ErrorAction Stop | Where-Object { $_.Extension -ieq $expectedExtension })
         if ($outputs.Count -ne 1) {
             throw "NSZ exited successfully but produced $($outputs.Count) '$expectedExtension' output files; expected exactly one."
         }
@@ -923,6 +947,7 @@ function Process-OneFile {
         [Parameter(Mandatory)][System.IO.FileInfo]$File,
         [bool]$IsStandalone = $false
     )
+    $script:LastCopyDestinationPath = $null
     if ($script:StopProcessing) { return 'Quit' }
 
     if ($script:CompressionEnabled -and $File.Extension -in @('.nsp', '.xci')) {
@@ -932,7 +957,7 @@ function Process-OneFile {
             $copyResult = Copy-FlatFile -File $conversion.OutputFile
             if ($copyResult -in @('Copy', 'Overwrite', 'KeepBoth')) {
                 if ($IsStandalone -and $script:DeleteStandaloneSources -and (Test-DeleteAllowed)) {
-                    $destinationPath = Join-Path $script:OutputFolder $conversion.OutputFile.Name
+                    $destinationPath = $script:LastCopyDestinationPath
                     if (-not (Test-DeleteCandidate -SourcePath $File.FullName -RequiredOutputs @($destinationPath))) {
                         Write-Host "Compressed output missing or invalid; original standalone file kept: $($File.Name)" -ForegroundColor Yellow
                         Write-Log -Message "Delete skipped for standalone '$($File.FullName)' because verification failed for output '$destinationPath'." -Level WARN
@@ -1054,21 +1079,22 @@ function Process-FinishedArchive {
     }
 
     $allFilesHandled = $true
+    $requiredOutputPaths = @()
     foreach ($file in $eligibleFiles) {
         if ($script:StopProcessing) { $allFilesHandled = $false; break }
         Write-Log -Message "Handling extracted file '$($file.FullName)' ($($file.Length) bytes). CompressionEnabled=$($script:CompressionEnabled)." -Level INFO
         $result = Process-OneFile -File $file -IsStandalone:$false
         Write-Log -Message "Handled extracted file '$($file.Name)': result='$result'." -Level INFO
-        if ($result -notin @('Copy', 'Overwrite', 'KeepBoth')) { $allFilesHandled = $false }
+        if ($result -notin @('Copy', 'Overwrite', 'KeepBoth') -or [string]::IsNullOrWhiteSpace($script:LastCopyDestinationPath)) {
+            $allFilesHandled = $false
+        } else {
+            $requiredOutputPaths += $script:LastCopyDestinationPath
+        }
     }
 
     if ($DeleteArchivesOnSuccess -and $allFilesHandled -and -not $script:StopProcessing -and (Test-DeleteAllowed)) {
         $volumeFiles = @(Get-ArchiveFilesToDelete -Archive $Entry.Archive)
         $deleteFailure = $false
-        $requiredOutputPaths = @()
-        foreach ($file in $eligibleFiles) {
-            $requiredOutputPaths += (Join-Path $script:OutputFolder $file.Name)
-        }
 
         Write-Log -Message "Archive content handling succeeded for '$($Entry.Archive.Name)'; attempting to delete source volumes: $($volumeFiles.Name -join ', ')." -Level INFO
         foreach ($volume in $volumeFiles) {
@@ -1112,12 +1138,18 @@ function Process-FinishedArchive {
 try { Add-Type -AssemblyName System.Windows.Forms } catch {
     Write-Host 'Unable to load Windows Forms for the folder/file pickers.' -ForegroundColor Red
     Write-Log -Message 'Unable to load System.Windows.Forms. Exiting.' -Level ERROR
-    Read-Host 'Press Enter to exit'
+    if (-not $script:NonInteractive) { Read-Host 'Press Enter to exit' }
     Stop-RunLogging
     exit 1
 }
 
 if ([string]::IsNullOrWhiteSpace($SourceFolder) -or -not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
+    if ($script:NonInteractive -and -not $script:Force) {
+        Write-Host 'A valid -SourceFolder is required in non-interactive mode.' -ForegroundColor Red
+        Write-Log -Message 'Non-interactive run requires a valid source folder; exiting.' -Level ERROR
+        Stop-RunLogging
+        exit 1
+    }
     $sourcePromptInitial = if ([string]::IsNullOrWhiteSpace($SourceFolder)) { $env:USERPROFILE } else { $SourceFolder }
     $sourceChoice = Select-Folder -Description 'Choose the folder that contains your RAR archive sets or loose .nsp/.xci files.' -InitialFolder $sourcePromptInitial
     if ([string]::IsNullOrWhiteSpace($sourceChoice)) {
@@ -1133,15 +1165,28 @@ if ([string]::IsNullOrWhiteSpace($SourceFolder) -or -not (Test-Path -LiteralPath
 if (-not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
     Write-Host "Source folder not found: $SourceFolder" -ForegroundColor Red
     Write-Log -Message "Source folder not found: '$SourceFolder'. Exiting." -Level ERROR
-    Read-Host 'Press Enter to exit'
+    if (-not $script:NonInteractive) { Read-Host 'Press Enter to exit' }
     Stop-RunLogging
     exit 1
 }
 
 $detectedArchives = @(Get-ArchiveStarts -Folder $SourceFolder)
 Write-Log -Message "Detected $($detectedArchives.Count) archive set(s) directly in source folder '$SourceFolder'." -Level INFO
-New-Item -ItemType Directory -Path $DefaultOutputFolder -Force | Out-Null
-$outputChoice = Select-Folder -Description 'Choose the destination for extracted and compressed files. Eligible files are flattened into this folder.' -InitialFolder $DefaultOutputFolder
+if (-not $script:DryRun -and [string]::IsNullOrWhiteSpace($OutputFolder)) {
+    New-Item -ItemType Directory -Path $DefaultOutputFolder -Force | Out-Null
+}
+$outputChoice = $OutputFolder
+if ([string]::IsNullOrWhiteSpace($outputChoice)) {
+    if ($script:NonInteractive -and -not $script:Force) {
+        $outputChoice = $DefaultOutputFolder
+    } else {
+        $outputPickerInitialFolder = $DefaultOutputFolder
+        if ($script:DryRun -and -not (Test-Path -LiteralPath $outputPickerInitialFolder -PathType Container)) {
+            $outputPickerInitialFolder = $SourceFolder
+        }
+        $outputChoice = Select-Folder -Description 'Choose the destination for extracted and compressed files. Eligible files are flattened into this folder.' -InitialFolder $outputPickerInitialFolder
+    }
+}
 if ([string]::IsNullOrWhiteSpace($outputChoice)) {
     Write-Host 'Cancelled. No files were processed.' -ForegroundColor Yellow
     Write-Log -Message 'User cancelled destination selection; no files processed.' -Level WARN
@@ -1149,7 +1194,9 @@ if ([string]::IsNullOrWhiteSpace($outputChoice)) {
     exit 0
 }
 $script:OutputFolder = $outputChoice
-New-Item -ItemType Directory -Path $script:OutputFolder -Force | Out-Null
+if (-not $script:DryRun) {
+    New-Item -ItemType Directory -Path $script:OutputFolder -Force | Out-Null
+}
 
 $looseScanFolders = @($SourceFolder, $script:OutputFolder)
 if (Read-YesNo -Prompt 'Would you like to scan another folder for previously extracted .nsp/.xci files to compress?') {
@@ -1165,6 +1212,22 @@ foreach ($folder in $looseScanFolders) {
 }
 $looseCandidates = @(Get-LooseGameFiles -Folders $uniqueFolders)
 Write-Log -Message "Scanned loose-file folders: $($uniqueFolders -join '; '); standalone NSP/XCI candidates=$($looseCandidates.Count)." -Level INFO
+
+if ($script:DryRun) {
+    Write-Host ''
+    Write-Host '===================== Dry run preview =====================' -ForegroundColor Cyan
+    Write-Host "Source folder:            $SourceFolder"
+    Write-Host "Destination:              $script:OutputFolder"
+    Write-Host "RAR archive sets found:   $($detectedArchives.Count)"
+    Write-Host "Loose NSP/XCI files found: $($looseCandidates.Count)"
+    Write-Host 'No dependencies will be installed, and no files or destination folders will be created, extracted, converted, copied, or deleted.' -ForegroundColor Yellow
+    Write-Host 'Diagnostic logs may still be written to the local app data logs directory.' -ForegroundColor Yellow
+    Write-Host '==========================================================' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Log -Message "Dry run preview completed. Archives=$($detectedArchives.Count); standalone files=$($looseCandidates.Count); no processing performed." -Level INFO
+    Stop-RunLogging
+    exit 0
+}
 
 # -------------------------- Dependency checks --------------------------
 $archiveProcessingEnabled = ($detectedArchives.Count -gt 0)
@@ -1249,21 +1312,6 @@ if ($DeleteArchivesOnSuccess) {
     Write-Host 'Archive delete confirmation: disabled' -ForegroundColor Yellow
 }
 
-if ($script:DryRun) {
-    Write-Host ''
-    Write-Host '===================== Dry run summary =====================' -ForegroundColor Cyan
-    Write-Host "Source folder:            $SourceFolder"
-    Write-Host "Destination:              $script:OutputFolder"
-    Write-Host "RAR archive sets:         $($script:Archives.Count)"
-    Write-Host "Loose NSP/XCI files:      $($script:StandaloneQueue.Count)"
-    Write-Host "Compression:              $($script:CompressionEnabled)"
-    Write-Host "Delete archives:          $DeleteArchivesOnSuccess"
-    Write-Host "Delete loose files:       $($script:DeleteStandaloneSources)"
-    Write-Host 'No files will be deleted during a dry run.' -ForegroundColor Yellow
-    Write-Host '==========================================================' -ForegroundColor Cyan
-    Write-Host ''
-}
-
 if ($script:Archives.Count -eq 0 -and $script:StandaloneQueue.Count -eq 0) {
     if ($detectedArchives.Count -eq 0 -and $looseCandidates.Count -eq 0) {
         Write-Host "No .rar archives or standalone .nsp/.xci files were found in the selected scan folders." -ForegroundColor Yellow
@@ -1274,7 +1322,7 @@ if ($script:Archives.Count -eq 0 -and $script:StandaloneQueue.Count -eq 0) {
     }
     Write-Host "Diagnostic log: $script:DiagnosticsLogPath"
     Write-Host "Transcript:     $script:TranscriptPath"
-    Read-Host 'Press Enter to exit'
+    if (-not $script:NonInteractive) { Read-Host 'Press Enter to exit' }
     Stop-RunLogging
     exit 0
 }
@@ -1347,9 +1395,6 @@ if ($script:CompressionEnabled -and $script:StandaloneQueue.Count -gt 0 -and -no
     }
 }
 
-    if ($script:DryRun) {
-        Write-Host 'Dry-run mode enabled: no source archives or loose files were deleted.' -ForegroundColor Yellow
-    }
 Write-Host ''
 Write-Host '==================== Run summary ====================' -ForegroundColor Cyan
 Write-Host "Source folder:             $SourceFolder"
@@ -1374,5 +1419,5 @@ if (-not $script:CompressionEnabled -and ($detectedArchives.Count -gt 0 -or $loo
 Write-Host '====================================================' -ForegroundColor Cyan
 Write-Log -Message "Run summary: archivesDetected=$($detectedArchives.Count); archivesProcessed=$($script:CompletedArchives); archivesDeleted=$($script:DeletedArchiveCount); copied=$($script:CopiedCount); skipped=$($script:SkippedCount); copyFailures=$($script:FailedCopyCount); extractionErrors=$($script:ErrorCount); extractionWarnings=$($script:WarningCount); conversionsPassed=$($script:ConversionSuccessCount); conversionErrors=$($script:ConversionErrorCount); standaloneProcessed=$($script:StandaloneProcessedCount)/$($script:TotalStandalone)." -Level INFO
 Write-Log -Message "Run finished. Transcript='$script:TranscriptPath'; diagnosticLog='$script:DiagnosticsLogPath'." -Level INFO
-Read-Host 'Press Enter to exit'
+if (-not $script:NonInteractive) { Read-Host 'Press Enter to exit' }
 Stop-RunLogging
