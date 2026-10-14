@@ -105,6 +105,7 @@ $script:ProgressDashboardLineCount = 0
 $script:ProgressDashboardRawUI = $null
 $script:ProgressDashboardInteractive = $false
 $script:ProgressDashboardCursorFailed = $false
+$script:DashboardRenderInProgress = $false
 $script:RunStartedAt = Get-Date
 $script:DashboardState = [pscustomobject]@{
     CurrentWork = 'Preparing'
@@ -1545,6 +1546,7 @@ function Set-DashboardOperationProgress {
 function Get-FileHashWithDashboard {
     param([Parameter(Mandatory)][string]$LiteralPath)
     $file = Get-Item -LiteralPath $LiteralPath -ErrorAction Stop
+    $previousWork = $script:DashboardState.CurrentWork
     $stream = $null
     $hasher = $null
     $buffer = New-Object byte[] (4MB)
@@ -1569,7 +1571,7 @@ function Get-FileHashWithDashboard {
     } finally {
         if ($hasher) { $hasher.Dispose() }
         if ($stream) { $stream.Dispose() }
-        Set-DashboardWork -Text $script:DashboardState.CurrentWork -ClearOperationProgress
+        Set-DashboardWork -Text $previousWork -ClearOperationProgress
     }
 }
 
@@ -1721,6 +1723,38 @@ function Get-DashboardRow {
     return '| ' + $Text.PadRight($innerWidth) + ' |'
 }
 
+function Write-Host {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromPipeline = $true)]
+        [object]$Object,
+        [string]$Separator = ' ',
+        [ConsoleColor]$ForegroundColor,
+        [ConsoleColor]$BackgroundColor,
+        [switch]$NoNewline
+    )
+    process {
+        $hostParameters = @{ Object = $Object; Separator = $Separator }
+        if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $hostParameters.ForegroundColor = $ForegroundColor }
+        if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $hostParameters.BackgroundColor = $BackgroundColor }
+        if ($NoNewline) { $hostParameters.NoNewline = $true }
+
+        if ($script:ProgressDashboardInteractive -and -not $script:DashboardRenderInProgress) {
+            $script:DashboardRenderInProgress = $true
+            try {
+                Clear-ProgressDashboard
+                Microsoft.PowerShell.Utility\Write-Host @hostParameters
+            } finally {
+                $script:DashboardRenderInProgress = $false
+            }
+            $script:DashboardState.LastRenderedAt = $null
+            Update-ProgressDashboard
+        } else {
+            Microsoft.PowerShell.Utility\Write-Host @hostParameters
+        }
+    }
+}
+
 function Write-ProgressDashboard {
     param(
         [Parameter(Mandatory)][object[]]$Rows,
@@ -1731,59 +1765,64 @@ function Write-ProgressDashboard {
     foreach ($row in $Rows) { $rendered += $row.Text }
     $rendered += $border
 
-    if ($script:ProgressDashboardInteractive) {
-        try {
-            $rawUI = $script:ProgressDashboardRawUI
-            $cursorBefore = $rawUI.CursorPosition
-            $windowTop = $rawUI.WindowPosition.Y
-            $visibleBottom = [Math]::Min($rawUI.BufferSize.Height - 1, $windowTop + $rawUI.WindowSize.Height - 1)
-            $requiredLines = [Math]::Max($script:ProgressDashboardLineCount, $rendered.Count)
-            $maxTop = $visibleBottom - $requiredLines - 1
-            if ($maxTop -lt $windowTop) {
-                throw 'The terminal window is too short to render the live dashboard without scrolling.'
-            }
-            if ($script:ProgressDashboardTop -lt $windowTop -or $script:ProgressDashboardTop -gt $maxTop) {
-                $script:ProgressDashboardTop = [Math]::Max($windowTop, [Math]::Min($cursorBefore.Y, $maxTop))
-            }
+    $script:DashboardRenderInProgress = $true
+    try {
+        if ($script:ProgressDashboardInteractive) {
+            try {
+                $rawUI = $script:ProgressDashboardRawUI
+                $cursorBefore = $rawUI.CursorPosition
+                $windowTop = $rawUI.WindowPosition.Y
+                $visibleBottom = [Math]::Min($rawUI.BufferSize.Height - 1, $windowTop + $rawUI.WindowSize.Height - 1)
+                $requiredLines = [Math]::Max($script:ProgressDashboardLineCount, $rendered.Count)
+                $maxTop = $visibleBottom - $requiredLines - 1
+                if ($maxTop -lt $windowTop) {
+                    throw 'The terminal window is too short to render the live dashboard without scrolling.'
+                }
+                if ($script:ProgressDashboardTop -lt $windowTop -or $script:ProgressDashboardTop -gt $maxTop) {
+                    $script:ProgressDashboardTop = [Math]::Max($windowTop, [Math]::Min($cursorBefore.Y, $maxTop))
+                }
 
-            $clearLine = ' ' * [Math]::Max(1, [Math]::Min($Width, $rawUI.WindowSize.Width) - 1)
-            for ($lineIndex = 0; $lineIndex -lt $script:ProgressDashboardLineCount; $lineIndex++) {
-                $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop + $lineIndex)
-                Write-Host $clearLine -NoNewline
-            }
+                $clearLine = ' ' * [Math]::Max(1, [Math]::Min($Width, $rawUI.WindowSize.Width) - 1)
+                for ($lineIndex = 0; $lineIndex -lt $script:ProgressDashboardLineCount; $lineIndex++) {
+                    $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop + $lineIndex)
+                    Write-Host $clearLine -NoNewline
+                }
 
-            $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop)
-            Write-Host $rendered[0] -ForegroundColor DarkCyan
-            for ($lineIndex = 0; $lineIndex -lt $Rows.Count; $lineIndex++) {
-                Write-Host $Rows[$lineIndex].Text -ForegroundColor $Rows[$lineIndex].Color
-            }
-            Write-Host $rendered[$rendered.Count - 1] -ForegroundColor DarkCyan
+                $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop)
+                Write-Host $rendered[0] -ForegroundColor DarkCyan
+                for ($lineIndex = 0; $lineIndex -lt $Rows.Count; $lineIndex++) {
+                    Write-Host $Rows[$lineIndex].Text -ForegroundColor $Rows[$lineIndex].Color
+                }
+                Write-Host $rendered[$rendered.Count - 1] -ForegroundColor DarkCyan
 
-            $script:ProgressDashboardLineCount = $rendered.Count
-            $restoreY = [Math]::Max($cursorBefore.Y, $script:ProgressDashboardTop + $script:ProgressDashboardLineCount)
-            if ($restoreY -gt $visibleBottom) { $restoreY = $visibleBottom }
-            $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $restoreY)
-        } catch {
-            $script:ProgressDashboardInteractive = $false
-            $script:ProgressDashboardCursorFailed = $true
-            $script:ProgressDashboardTop = $null
-            $script:ProgressDashboardLineCount = 0
-            Write-Log -Message "Live dashboard cursor rendering is unavailable; using text output instead: $($_.Exception.Message)" -Level WARN
+                $script:ProgressDashboardLineCount = $rendered.Count
+                $restoreY = [Math]::Max($cursorBefore.Y, $script:ProgressDashboardTop + $script:ProgressDashboardLineCount)
+                if ($restoreY -gt $visibleBottom) { $restoreY = $visibleBottom }
+                $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $restoreY)
+            } catch {
+                $script:ProgressDashboardInteractive = $false
+                $script:ProgressDashboardCursorFailed = $true
+                $script:ProgressDashboardTop = $null
+                $script:ProgressDashboardLineCount = 0
+                Write-Log -Message "Live dashboard cursor rendering is unavailable; using text output instead: $($_.Exception.Message)" -Level WARN
+                for ($lineIndex = 0; $lineIndex -lt $rendered.Count; $lineIndex++) {
+                    $color = if ($lineIndex -eq 0 -or $lineIndex -eq ($rendered.Count - 1)) { 'DarkCyan' } else { $Rows[$lineIndex - 1].Color }
+                    Write-Host $rendered[$lineIndex] -ForegroundColor $color
+                }
+            }
+        } else {
             for ($lineIndex = 0; $lineIndex -lt $rendered.Count; $lineIndex++) {
-                $color = if ($lineIndex -eq 0 -or $lineIndex -eq ($rendered.Count - 1)) { 'DarkCyan' } else { $Rows[$lineIndex - 1].Color }
-                Write-Host $rendered[$lineIndex] -ForegroundColor $color
+                if ($lineIndex -eq 0 -or $lineIndex -eq ($rendered.Count - 1)) {
+                    Write-Host $rendered[$lineIndex] -ForegroundColor DarkCyan
+                } else {
+                    Write-Host $rendered[$lineIndex] -ForegroundColor $Rows[$lineIndex - 1].Color
+                }
             }
         }
-    } else {
-        for ($lineIndex = 0; $lineIndex -lt $rendered.Count; $lineIndex++) {
-            if ($lineIndex -eq 0 -or $lineIndex -eq ($rendered.Count - 1)) {
-                Write-Host $rendered[$lineIndex] -ForegroundColor DarkCyan
-            } else {
-                Write-Host $rendered[$lineIndex] -ForegroundColor $Rows[$lineIndex - 1].Color
-            }
-        }
+        try { [Console]::Out.Flush() } catch {}
+    } finally {
+        $script:DashboardRenderInProgress = $false
     }
-    try { [Console]::Out.Flush() } catch {}
 }
 
 function Update-ProgressDashboard {
@@ -1996,27 +2035,33 @@ function Update-ProgressDashboard {
 }
 
 function Clear-ProgressDashboard {
-    if ($script:ProgressDashboardInteractive -and $script:ProgressDashboardLineCount -gt 0) {
-        try {
-            $rawUI = $script:ProgressDashboardRawUI
-            $cursorBefore = $rawUI.CursorPosition
-            $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop)
-            $clearLine = ' ' * [Math]::Max(1, [Math]::Min($rawUI.WindowSize.Width, 96) - 1)
-            for ($lineIndex = 0; $lineIndex -lt $script:ProgressDashboardLineCount; $lineIndex++) {
-                Write-Host $clearLine -NoNewline
-                $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop + $lineIndex + 1)
+    $previousRenderState = $script:DashboardRenderInProgress
+    $script:DashboardRenderInProgress = $true
+    try {
+        if ($script:ProgressDashboardInteractive -and $script:ProgressDashboardLineCount -gt 0) {
+            try {
+                $rawUI = $script:ProgressDashboardRawUI
+                $cursorBefore = $rawUI.CursorPosition
+                $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop)
+                $clearLine = ' ' * [Math]::Max(1, [Math]::Min($rawUI.WindowSize.Width, 96) - 1)
+                for ($lineIndex = 0; $lineIndex -lt $script:ProgressDashboardLineCount; $lineIndex++) {
+                    Write-Host $clearLine -NoNewline
+                    $rawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $script:ProgressDashboardTop + $lineIndex + 1)
+                }
+                $rawUI.CursorPosition = $cursorBefore
+            } catch {
+                $script:ProgressDashboardCursorFailed = $true
+                Write-Log -Message "Could not clear the live dashboard: $($_.Exception.Message)" -Level WARN
             }
-            $rawUI.CursorPosition = $cursorBefore
-        } catch {
-            $script:ProgressDashboardCursorFailed = $true
-            Write-Log -Message "Could not clear the live dashboard: $($_.Exception.Message)" -Level WARN
         }
+        $script:DashboardState.LastRenderedAt = $null
+        $script:ProgressDashboardTop = $null
+        $script:ProgressDashboardLineCount = 0
+        $script:ProgressDashboardRawUI = $null
+        $script:ProgressDashboardInteractive = $false
+    } finally {
+        $script:DashboardRenderInProgress = $previousRenderState
     }
-    $script:DashboardState.LastRenderedAt = $null
-    $script:ProgressDashboardTop = $null
-    $script:ProgressDashboardLineCount = 0
-    $script:ProgressDashboardRawUI = $null
-    $script:ProgressDashboardInteractive = $false
 }
 
 function Start-NSZConversion {
