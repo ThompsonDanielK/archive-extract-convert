@@ -7,7 +7,7 @@ This project was created and iteratively improved with GitHub Copilot as a codin
 ## What it does
 
 - scans a source folder for RAR archive sets
-- extracts archive contents with WinRAR
+- extracts archive contents with WinRAR into unique, script-owned staging folders on the destination volume
 - adaptively increases extraction and compression concurrency when queued work and system resources allow, with no fixed job-count ceiling in resource-monitoring mode
 - starts compression for newly finished archive extractions while other conversions are still running, when an NSZ slot is available
 - flattens extracted files into a destination folder
@@ -32,6 +32,8 @@ This project was created and iteratively improved with GitHub Copilot as a codin
 - makes `-DryRun` preview detected inputs without installing dependencies or creating destination folders/files
 - avoids deleting source files in `-DryRun` or `-NoDelete` mode
 - verifies placed output contents with SHA-256 once before deleting each original RAR archive set, while still validating each source volume; if a later same-name file overwrites an earlier result, deletion of the earlier source is blocked
+- moves uncompressed extracted files from destination-volume staging into their final paths, avoiding a second large cross-volume copy; files are compared with conflicting destinations before replacement
+- destination-volume staging requires enough free space there for extracted data while each archive is being processed; the existing disk reserve gate applies to that volume
 - excludes the script's temporary ownership marker from extracted files
 - skips same-name files only when SHA-256 hashes match; otherwise, the incoming file replaces the existing one
 - in adaptive mode, starts with one extraction and one conversion slot, then increases capacity only when queued work exists and CPU, available memory, disk activity, and free space have headroom

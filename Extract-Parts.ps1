@@ -613,7 +613,7 @@ function Clear-StaleTemporaryFolders {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         try {
             $candidateFolders = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop | Where-Object {
-                $_.Name -match '^(ArchiveExtract_[0-9a-f]{32}|\.ExtractParts_NszOutput_[0-9a-f]{32})$'
+                $_.Name -match '^(ArchiveExtract_[0-9a-f]{32}|\.ExtractParts_ArchiveExtract_[0-9a-f]{32}|\.ExtractParts_NszOutput_[0-9a-f]{32})$'
             })
         } catch {
             $script:WarningCount++
@@ -1192,7 +1192,7 @@ function Copy-FlatFile {
     if ($script:StopProcessing) { return 'Quit' }
     Write-Log -Message "$operation destination handling started: source='$($File.FullName)'; target='$destination'; bytes=$sourceLength." -Level DEBUG
     $exists = Test-Path -LiteralPath $destination
-    $action = 'Copy'
+    $action = if ($MoveSource) { 'Move' } else { 'Copy' }
     $incomingHash = $null
     $verifyForDeletion = (Test-DeleteAllowed) -and ($DeleteArchivesOnSuccess -or $script:DeleteStandaloneSources)
     if ($exists) {
@@ -1245,7 +1245,7 @@ function Copy-FlatFile {
         }
         $script:LastCopyDestinationPath = $destination
         $script:CopiedCount++
-        Write-Log -Message "$operation $action succeeded: '$($File.FullName)' -> '$destination' ($sourceLength bytes)." -Level INFO
+        Write-Log -Message "$operation operation ($action) succeeded: '$($File.FullName)' -> '$destination' ($sourceLength bytes)." -Level INFO
         return $action
     } catch {
         $script:FailedCopyCount++
@@ -1454,7 +1454,7 @@ function Start-NextExtraction {
     $archive = $script:Archives[$script:NextArchiveIndex]
     $queueNumber = $script:NextArchiveIndex + 1
     $script:NextArchiveIndex++
-    $tempFolder = Join-Path $env:TEMP ("ArchiveExtract_{0}" -f ([guid]::NewGuid().ToString('N')))
+    $tempFolder = Join-Path $script:OutputFolder (".ExtractParts_ArchiveExtract_{0}" -f ([guid]::NewGuid().ToString('N')))
     $safeName = [regex]::Replace([System.IO.Path]::GetFileNameWithoutExtension($archive.Name), '[^A-Za-z0-9._-]', '_')
     $workerLogPath = Join-Path $script:RunLogFolder ("RAR_{0:D3}_{1}_{2}.log" -f $queueNumber, $safeName, ([guid]::NewGuid().ToString('N').Substring(0,8)))
     Set-DashboardWork -Text "Starting extraction of $($archive.Name)" -ClearOperationProgress
@@ -1483,7 +1483,7 @@ function Start-NextExtraction {
         } else {
             "fixedLimit=$MaxParallel"
         }
-        Write-Log -Message "Started parallel extraction queue #$queueNumber/$($script:TotalArchives): archive='$($archive.FullName)'; jobId=$($job.Id); temp='$tempFolder'; workerLog='$workerLogPath'. Active=$($script:Active.Count); $capacityDescription" -Level INFO
+        Write-Log -Message "Started parallel extraction queue #$queueNumber/$($script:TotalArchives): archive='$($archive.FullName)'; jobId=$($job.Id); destinationVolumeStaging='$tempFolder'; workerLog='$workerLogPath'. Active=$($script:Active.Count); $capacityDescription" -Level INFO
     } catch {
         Remove-TemporaryFolder -Path $tempFolder -Purpose 'extraction'
         $script:ErrorCount++
@@ -2197,7 +2197,7 @@ function Process-ConvertedOutput {
         Set-DashboardWork -Text "Placing compressed output: $($Conversion.OutputFile.Name)" -ClearOperationProgress
         if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
         $copyResult = Copy-FlatFile -File $Conversion.OutputFile -MoveSource
-        if ($copyResult -in @('Copy', 'Overwrite', 'Identical')) {
+        if ($copyResult -in @('Copy', 'Move', 'Overwrite', 'Identical')) {
             if ($IsStandalone -and $script:DeleteStandaloneSources -and (Test-DeleteAllowed) -and -not $script:StopProcessing) {
                 $destinationPath = $script:LastCopyDestinationPath
                 $requiredOutput = [pscustomobject]@{ Path = $destinationPath; Hash = $script:LastCopyDestinationHash }
@@ -2232,7 +2232,8 @@ function Process-ConvertedOutput {
 function Process-FileBatch {
     param(
         [Parameter(Mandatory)][System.IO.FileInfo[]]$Files,
-        [bool]$IsStandalone = $false
+        [bool]$IsStandalone = $false,
+        [switch]$MoveUncompressedSources
     )
     $conversionRecords = @()
     foreach ($file in $Files) {
@@ -2279,7 +2280,11 @@ function Process-FileBatch {
         } else {
             Set-DashboardWork -Text "Copying extracted file: $($file.Name)" -ClearOperationProgress
             if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
-            $result = Copy-FlatFile -File $file
+            if ($MoveUncompressedSources) {
+                $result = Copy-FlatFile -File $file -MoveSource
+            } else {
+                $result = Copy-FlatFile -File $file
+            }
         }
         $outcomes += [pscustomobject]@{
             File = $file
@@ -2320,7 +2325,7 @@ function Complete-ArchiveFileHandling {
         }
         $outcome = $matchedOutcomes[0]
         Write-Log -Message "Handled extracted file '$($file.Name)': result='$($outcome.Result)'." -Level INFO
-        if ($outcome.Result -notin @('Copy', 'Overwrite', 'Identical') -or [string]::IsNullOrWhiteSpace($outcome.DestinationPath)) {
+        if ($outcome.Result -notin @('Copy', 'Move', 'Overwrite', 'Identical') -or [string]::IsNullOrWhiteSpace($outcome.DestinationPath)) {
             $allFilesHandled = $false
         } else {
             $requiredOutputPaths += [pscustomobject]@{ Path = $outcome.DestinationPath; Hash = $outcome.DestinationHash }
@@ -2510,7 +2515,7 @@ function Process-FinishedArchives {
     if ($contexts.Count -eq 0) { return }
     $batchFiles = @()
     foreach ($context in $contexts) { $batchFiles += $context.Files }
-    $batchOutcomes = @(Process-FileBatch -Files $batchFiles)
+    $batchOutcomes = @(Process-FileBatch -Files $batchFiles -MoveUncompressedSources)
     foreach ($context in $contexts) {
         Complete-ArchiveFileHandling -Entry $context.Entry -Files $context.Files -Outcomes $batchOutcomes
     }
