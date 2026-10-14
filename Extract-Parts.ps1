@@ -100,16 +100,19 @@ $script:StopProcessing = $false
 $script:StopReason = $null
 $script:LastCopyDestinationPath = $null
 $script:LastCopyDestinationHash = $null
-$script:ProgressDashboardLastPrintedAt = $null
 $script:ProgressDashboardTop = $null
 $script:ProgressDashboardLineCount = 0
 $script:ProgressDashboardRawUI = $null
 $script:ProgressDashboardInteractive = $false
 $script:ProgressDashboardCursorFailed = $false
 $script:RunStartedAt = Get-Date
-$script:CurrentWork = 'Preparing'
-$script:CurrentOperationPercent = $null
-$script:CurrentOperationLabel = $null
+$script:DashboardState = [pscustomobject]@{
+    CurrentWork = 'Preparing'
+    OperationPercent = $null
+    OperationLabel = $null
+    Rows = @()
+    LastRenderedAt = $null
+}
 $script:ProgressStage = 'Archives'
 $script:Active = @()
 $script:ActiveConversions = @()
@@ -1184,7 +1187,7 @@ function Copy-FlatFile {
     $destination = Join-Path $script:OutputFolder $File.Name
     $sourceLength = $File.Length
     $operation = if ($MoveSource) { 'Move' } else { 'Copy' }
-    $script:CurrentWork = "$operation output: $($File.Name)"
+    Set-DashboardWork -Text "$operation output: $($File.Name)" -ClearOperationProgress
     if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
     if ($script:StopProcessing) { return 'Quit' }
     Write-Log -Message "$operation destination handling started: source='$($File.FullName)'; target='$destination'; bytes=$sourceLength." -Level DEBUG
@@ -1454,7 +1457,7 @@ function Start-NextExtraction {
     $tempFolder = Join-Path $env:TEMP ("ArchiveExtract_{0}" -f ([guid]::NewGuid().ToString('N')))
     $safeName = [regex]::Replace([System.IO.Path]::GetFileNameWithoutExtension($archive.Name), '[^A-Za-z0-9._-]', '_')
     $workerLogPath = Join-Path $script:RunLogFolder ("RAR_{0:D3}_{1}_{2}.log" -f $queueNumber, $safeName, ([guid]::NewGuid().ToString('N').Substring(0,8)))
-    $script:CurrentWork = "Starting extraction of $($archive.Name)"
+    Set-DashboardWork -Text "Starting extraction of $($archive.Name)" -ClearOperationProgress
     try {
         New-TemporaryWorkFolder -Path $tempFolder
         Set-Content -LiteralPath $workerLogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] RAR worker log for '$($archive.Name)'" -Encoding UTF8
@@ -1518,6 +1521,27 @@ function Get-ElapsedLabel {
     return '{0:00}:{1:00}:{2:00}' -f [Math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
 }
 
+function Set-DashboardWork {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [switch]$ClearOperationProgress
+    )
+    $script:DashboardState.CurrentWork = $Text
+    if ($ClearOperationProgress) {
+        $script:DashboardState.OperationPercent = $null
+        $script:DashboardState.OperationLabel = $null
+    }
+}
+
+function Set-DashboardOperationProgress {
+    param(
+        [Parameter(Mandatory)][int]$Percent,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $script:DashboardState.OperationPercent = [Math]::Min(100, [Math]::Max(0, $Percent))
+    $script:DashboardState.OperationLabel = $Label
+}
+
 function Get-FileHashWithDashboard {
     param([Parameter(Mandatory)][string]$LiteralPath)
     $file = Get-Item -LiteralPath $LiteralPath -ErrorAction Stop
@@ -1534,9 +1558,8 @@ function Get-FileHashWithDashboard {
             $bytesReadTotal += $bytesRead
             $percent = if ($file.Length -gt 0) { [int][Math]::Floor(100 * $bytesReadTotal / $file.Length) } else { 100 }
             if ($percent -ne $lastPercent) {
-                $script:CurrentWork = "Verifying SHA-256: $($file.Name) ($percent%)"
-                $script:CurrentOperationPercent = $percent
-                $script:CurrentOperationLabel = "SHA-256 $($file.Name)"
+                Set-DashboardWork -Text "Verifying SHA-256: $($file.Name) ($percent%)"
+                Set-DashboardOperationProgress -Percent $percent -Label "SHA-256 $($file.Name)"
                 $lastPercent = $percent
             }
             Update-ProgressDashboard -FileOperation
@@ -1546,8 +1569,7 @@ function Get-FileHashWithDashboard {
     } finally {
         if ($hasher) { $hasher.Dispose() }
         if ($stream) { $stream.Dispose() }
-        $script:CurrentOperationPercent = $null
-        $script:CurrentOperationLabel = $null
+        Set-DashboardWork -Text $script:DashboardState.CurrentWork -ClearOperationProgress
     }
 }
 
@@ -1572,9 +1594,8 @@ function Copy-FileWithDashboard {
             $bytesCopied += $bytesRead
             $percent = if ($source.Length -gt 0) { [int][Math]::Floor(100 * $bytesCopied / $source.Length) } else { 100 }
             if ($percent -ne $lastPercent) {
-                $script:CurrentWork = "Copying $($source.Name): $percent%"
-                $script:CurrentOperationPercent = $percent
-                $script:CurrentOperationLabel = "Copy $($source.Name)"
+                Set-DashboardWork -Text "Copying $($source.Name): $percent%"
+                Set-DashboardOperationProgress -Percent $percent -Label "Copy $($source.Name)"
                 $lastPercent = $percent
             }
             Update-ProgressDashboard -FileOperation
@@ -1583,8 +1604,7 @@ function Copy-FileWithDashboard {
     } finally {
         if ($outputStream) { $outputStream.Dispose() }
         if ($inputStream) { $inputStream.Dispose() }
-        $script:CurrentOperationPercent = $null
-        $script:CurrentOperationLabel = $null
+        Set-DashboardWork -Text $script:DashboardState.CurrentWork -ClearOperationProgress
     }
 }
 
@@ -1768,6 +1788,11 @@ function Write-ProgressDashboard {
 
 function Update-ProgressDashboard {
     param([switch]$FileOperation)
+    $now = Get-Date
+    if ($script:DashboardState.LastRenderedAt -and
+        ($now - $script:DashboardState.LastRenderedAt).TotalSeconds -lt 1) {
+        return
+    }
     $pendingItems = @()
     $pendingCount = 0
     $rows = @()
@@ -1824,10 +1849,10 @@ function Update-ProgressDashboard {
         }
     }
     $rows += [pscustomobject]@{ Text = Get-DashboardRow -Text (" Handled  [{0}]  {1,3}%  |  {2}" -f $bar, $percent, $progressDetails) -Width $windowWidth; Color = 'Green' }
-    $currentStep = if ([string]::IsNullOrWhiteSpace($script:CurrentWork)) { 'Waiting for the next item' } else { $script:CurrentWork }
+    $currentStep = if ([string]::IsNullOrWhiteSpace($script:DashboardState.CurrentWork)) { 'Waiting for the next item' } else { $script:DashboardState.CurrentWork }
     $rows += [pscustomobject]@{ Text = Get-DashboardRow -Text (" Current   {0}" -f $currentStep) -Width $windowWidth; Color = 'Yellow' }
-    $itemProgressPercent = $script:CurrentOperationPercent
-    $itemProgressLabel = $script:CurrentOperationLabel
+    $itemProgressPercent = $script:DashboardState.OperationPercent
+    $itemProgressLabel = $script:DashboardState.OperationLabel
     if ($null -eq $itemProgressPercent -and $script:ProgressStage -eq 'Archives') {
         $activeItem = @($script:Active | Where-Object { $null -ne $_.ProgressPercent } | Select-Object -First 1)
         if ($activeItem.Count -gt 0) {
@@ -1939,12 +1964,9 @@ function Update-ProgressDashboard {
     $summary = "Results: {0} placed | {1} identical skipped | {2} conversions passed | {3} errors | {4} warnings" -f $script:CopiedCount, $script:SkippedCount, $script:ConversionSuccessCount, ($script:ErrorCount + $script:ConversionErrorCount + $script:FailedCopyCount), $script:WarningCount
     $rows += [pscustomobject]@{ Text = Get-DashboardRow -Text $summary -Width $windowWidth; Color = $resultColor }
 
-    $printIntervalElapsed = $null -eq $script:ProgressDashboardLastPrintedAt -or
-        ((Get-Date) - $script:ProgressDashboardLastPrintedAt).TotalSeconds -ge 1
-    if ($printIntervalElapsed) {
-        Write-ProgressDashboard -Rows $rows -Width $windowWidth
-        $script:ProgressDashboardLastPrintedAt = Get-Date
-    }
+    $script:DashboardState.Rows = $rows
+    Write-ProgressDashboard -Rows $script:DashboardState.Rows -Width $windowWidth
+    $script:DashboardState.LastRenderedAt = Get-Date
 
     # Render the current state before polling jobs or resource providers so a slow
     # host/provider cannot prevent the user from seeing that work has started.
@@ -1990,7 +2012,7 @@ function Clear-ProgressDashboard {
             Write-Log -Message "Could not clear the live dashboard: $($_.Exception.Message)" -Level WARN
         }
     }
-    $script:ProgressDashboardLastPrintedAt = $null
+    $script:DashboardState.LastRenderedAt = $null
     $script:ProgressDashboardTop = $null
     $script:ProgressDashboardLineCount = 0
     $script:ProgressDashboardRawUI = $null
@@ -2004,7 +2026,7 @@ function Start-NSZConversion {
     if ($script:StopProcessing -or $script:DiskReserveBlocked -or $script:DiskReserveUnavailable) { return $null }
     $workFolder = Join-Path $script:OutputFolder (".ExtractParts_NszOutput_{0}" -f ([guid]::NewGuid().ToString('N')))
     $expectedExtension = if ($File.Extension -ieq '.nsp') { '.nsz' } else { '.xcz' }
-    $script:CurrentWork = "Starting $($expectedExtension.ToUpperInvariant()) conversion for $($File.Name)"
+    Set-DashboardWork -Text "Starting $($expectedExtension.ToUpperInvariant()) conversion for $($File.Name)" -ClearOperationProgress
     if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
     if ($script:StopProcessing -or $script:DiskReserveBlocked -or $script:DiskReserveUnavailable) { return $null }
     try {
@@ -2025,7 +2047,7 @@ function Start-NSZConversion {
             LastProgressAt = Get-Date
         }
         $script:ActiveConversions += $task
-        $script:CurrentWork = "Converting $($File.Name)"
+        Set-DashboardWork -Text "Converting $($File.Name)" -ClearOperationProgress
         if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
         return $task
     } catch {
@@ -2059,7 +2081,7 @@ function Complete-NSZConversion {
     }
     $expectedExtension = if ($file.Extension -ieq '.nsp') { '.nsz' } else { '.xcz' }
     $job = $Task.Job
-    $script:CurrentWork = "Waiting for NSZ conversion to finish: $($file.Name)"
+    Set-DashboardWork -Text "Waiting for NSZ conversion to finish: $($file.Name)" -ClearOperationProgress
     if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
     try {
         $result = $null
@@ -2101,7 +2123,7 @@ function Complete-NSZConversion {
                         $script:PendingConversionNextIndex = $savedPendingNextIndex
                         $script:PendingConversions = $savedPendingCount
                         $script:ProcessingFinishedArchiveEntries = $false
-                        $script:CurrentWork = "Waiting for NSZ conversion to finish: $($file.Name)"
+                        Set-DashboardWork -Text "Waiting for NSZ conversion to finish: $($file.Name)"
                     }
                 }
             }
@@ -2172,7 +2194,7 @@ function Process-ConvertedOutput {
     if (-not $Conversion.Success) { return 'Failed' }
 
     try {
-        $script:CurrentWork = "Placing compressed output: $($Conversion.OutputFile.Name)"
+        Set-DashboardWork -Text "Placing compressed output: $($Conversion.OutputFile.Name)" -ClearOperationProgress
         if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
         $copyResult = Copy-FlatFile -File $Conversion.OutputFile -MoveSource
         if ($copyResult -in @('Copy', 'Overwrite', 'Identical')) {
@@ -2236,7 +2258,7 @@ function Process-FileBatch {
         if ($conversionRecord.Count -gt 0) {
             $record = $conversionRecord[0]
             while (-not $script:StopProcessing -and -not $record.Task -and $record.QueueIndex -ge $script:PendingConversionNextIndex) {
-                $script:CurrentWork = "Waiting for a conversion slot: $($file.Name)"
+                Set-DashboardWork -Text "Waiting for a conversion slot: $($file.Name)" -ClearOperationProgress
                 Update-ProgressDashboard
                 Start-PendingConversions
                 if (-not $record.Task -and $record.QueueIndex -ge $script:PendingConversionNextIndex) {
@@ -2255,7 +2277,7 @@ function Process-FileBatch {
             Start-PendingConversions
             $result = Process-ConvertedOutput -File $file -Conversion $conversion -IsStandalone:$IsStandalone
         } else {
-            $script:CurrentWork = "Copying extracted file: $($file.Name)"
+            Set-DashboardWork -Text "Copying extracted file: $($file.Name)" -ClearOperationProgress
             if ($script:ProgressStage -in @('Archives', 'Standalone')) { Update-ProgressDashboard }
             $result = Copy-FlatFile -File $file
         }
@@ -2306,7 +2328,7 @@ function Complete-ArchiveFileHandling {
     }
 
     if ($DeleteArchivesOnSuccess -and $allFilesHandled -and -not $script:StopProcessing -and (Test-DeleteAllowed)) {
-        $script:CurrentWork = "Verifying outputs and cleaning up archive: $($Entry.Archive.Name)"
+        Set-DashboardWork -Text "Verifying outputs and cleaning up archive: $($Entry.Archive.Name)" -ClearOperationProgress
         if ($script:ProgressStage -eq 'Archives') { Update-ProgressDashboard }
         $volumeFiles = @(Get-ArchiveFilesToDelete -Archive $Entry.Archive)
         $deleteFailure = $false
@@ -2314,7 +2336,7 @@ function Complete-ArchiveFileHandling {
         Write-Log -Message "Archive content handling succeeded for '$($Entry.Archive.Name)'; attempting to delete source volumes: $($volumeFiles.Name -join ', ')." -Level INFO
         $outputsVerified = $false
         if ($volumeFiles.Count -gt 0) {
-            $script:CurrentWork = "Verifying destination before deleting archive set: $($Entry.Archive.Name)"
+            Set-DashboardWork -Text "Verifying destination before deleting archive set: $($Entry.Archive.Name)" -ClearOperationProgress
             if ($script:ProgressStage -eq 'Archives') { Update-ProgressDashboard }
             $outputsVerified = Test-DeleteCandidate -SourcePath $volumeFiles[0].FullName -RequiredOutputs $requiredOutputPaths
             if (-not $outputsVerified) {
@@ -2359,7 +2381,7 @@ function Complete-ArchiveFileHandling {
             Write-Host "Output succeeded, but one or more source volume files could not be deleted for: $($Entry.Archive.Name)" -ForegroundColor Yellow
         }
     } else {
-        $script:CurrentWork = "Keeping archive after output handling: $($Entry.Archive.Name)"
+        Set-DashboardWork -Text "Keeping archive after output handling: $($Entry.Archive.Name)" -ClearOperationProgress
         if ($script:ProgressStage -eq 'Archives') { Update-ProgressDashboard }
         if (-not (Test-DeleteAllowed)) {
             Write-Host "Keeping source archive: $($Entry.Archive.Name) (dry-run/no-delete mode is enabled)." -ForegroundColor Yellow
@@ -2380,7 +2402,7 @@ function Process-FinishedArchives {
     Receive-ExtractionJobUpdates -Entries $Entries
     $contexts = @()
     foreach ($Entry in $Entries) {
-        $script:CurrentWork = "Checking extraction result: $($Entry.Archive.Name)"
+        Set-DashboardWork -Text "Checking extraction result: $($Entry.Archive.Name)" -ClearOperationProgress
         if ($script:ProgressStage -eq 'Archives') { Update-ProgressDashboard }
         $exitCode = 999
         $detail = ''
@@ -2468,7 +2490,7 @@ function Process-FinishedArchives {
             continue
         }
 
-        $script:CurrentWork = "Scanning extracted files: $($Entry.Archive.Name)"
+        Set-DashboardWork -Text "Scanning extracted files: $($Entry.Archive.Name)" -ClearOperationProgress
         Update-ProgressDashboard
         $eligibleFiles = @(Get-EligibleFiles -Folder $Entry.TempFolder)
         Write-Log -Message "Archive extraction contents scanned: '$($Entry.Archive.Name)'; eligible files=$($eligibleFiles.Count); temp='$($Entry.TempFolder)'." -Level INFO
@@ -2748,7 +2770,7 @@ Write-Host ''
 
 # ---------------------- Parallel archive extraction ----------------------
 $script:ProgressStage = 'Archives'
-$script:CurrentWork = 'Waiting for archive extraction to finish'
+Set-DashboardWork -Text 'Waiting for archive extraction to finish' -ClearOperationProgress
 Write-Host 'Step: Extracting archives and handling their output files.' -ForegroundColor Cyan
 while (-not $script:StopProcessing -and -not $script:DiskReserveBlocked -and -not $script:DiskReserveUnavailable -and
     $script:Active.Count -lt $script:EffectiveMaxParallel -and $script:NextArchiveIndex -lt $script:Archives.Count) { Start-NextExtraction }
@@ -2773,7 +2795,7 @@ while ((-not $script:StopProcessing -and $script:NextArchiveIndex -lt $script:Ar
 
         Process-FinishedArchives -Entries $finished
     } elseif ($script:Active.Count -gt 0) {
-        $script:CurrentWork = "Waiting for progress from $($script:Active.Count) extraction job(s)"
+        Set-DashboardWork -Text "Waiting for progress from $($script:Active.Count) extraction job(s)"
     }
 
     Update-ProgressDashboard
@@ -2790,13 +2812,13 @@ $script:Active = @()
 # ---------------------- Previously extracted files ----------------------
 if ($script:CompressionEnabled -and $script:StandaloneQueue.Count -gt 0 -and -not $script:StopProcessing) {
     $script:ProgressStage = 'Standalone'
-    $script:CurrentWork = 'Starting standalone NSP/XCI conversions'
+    Set-DashboardWork -Text 'Starting standalone NSP/XCI conversions' -ClearOperationProgress
     while ($script:StandaloneNextIndex -lt $script:StandaloneQueue.Count -and -not $script:StopProcessing) {
         $remainingFiles = $script:StandaloneQueue.Count - $script:StandaloneNextIndex
         $batchCount = if ($script:AdaptiveConcurrencyEnabled) { $remainingFiles } else { [Math]::Min($MaxParallelConversions, $remainingFiles) }
         $batch = @($script:StandaloneQueue[$script:StandaloneNextIndex..($script:StandaloneNextIndex + $batchCount - 1)])
         $script:StandaloneNextIndex += $batchCount
-        $script:CurrentWork = "Converting next $batchCount standalone file(s)"
+        Set-DashboardWork -Text "Converting next $batchCount standalone file(s)" -ClearOperationProgress
         Update-ProgressDashboard
         $outcomes = @(Process-FileBatch -Files $batch -IsStandalone:$true)
         foreach ($outcome in $outcomes) {

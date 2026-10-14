@@ -15,7 +15,8 @@ This project was created and iteratively improved with GitHub Copilot as a codin
 - displays a color-coded live dashboard with extraction/conversion states, current steps, elapsed times, queue previews, and results
 - separates the archive-set completion bar from the current-item progress bar, so extraction, copy, and SHA-256 progress can advance before an archive set is fully handled
 - shows WinRAR progress percentages as they are emitted (including carriage-return updates) and NSZ percentages when available, with an approximate per-item ETA after enough progress has been observed; the ETA is for the current archive item/conversion, not the whole run
-- redraws the dashboard in place at one-second intervals in interactive terminals and emits one-second snapshots when output is redirected; large file copies and SHA-256 checks report byte progress without blocking the dashboard loop
+- keeps dashboard display values in a shared state object; only the centralized one-second refresh gate renders it, in place for interactive terminals and as snapshots when output is redirected
+- large file copies and SHA-256 checks update dashboard state with byte progress while the refresh gate continues to render at one-second intervals
 - displays current CPU, available-memory, disk-activity, free-space, and adaptive concurrency status in the dashboard
 - lets an interactive user press `Q` to stop starting work; active jobs finish and source files are preserved
 - reports when a tool has not emitted a progress update for five minutes; this is informational and does not automatically terminate long-running work
